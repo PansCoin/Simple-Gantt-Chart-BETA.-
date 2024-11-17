@@ -1,0 +1,760 @@
+import sys
+from PyQt5.QtWidgets import (
+    QApplication, QMainWindow, QTableWidget, QTableWidgetItem, QDateTimeEdit,
+    QMenu, QVBoxLayout, QWidget, QAction, QStackedWidget, QPushButton, QHBoxLayout
+)
+from PyQt5.QtCore import Qt, QDateTime
+from PyQt5.QtGui import QFont, QKeySequence
+from datetime import datetime, timedelta
+from matplotlib.figure import Figure
+from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
+import matplotlib.dates as mdates
+
+
+class ActivityTableApp(QMainWindow):
+    def __init__(self):
+        super().__init__()
+
+        # Set up main window properties
+        self.setWindowTitle("Activity Table with Hierarchy and CPM")
+        self.setGeometry(100, 100, 1200, 600)  # Increased height for Gantt chart controls
+
+        # Create a central widget and layout
+        self.central_widget = QWidget()
+        self.layout = QVBoxLayout(self.central_widget)
+        self.setCentralWidget(self.central_widget)
+
+        # Create stacked widget for multiple pages
+        self.stacked_widget = QStackedWidget()
+        self.layout.addWidget(self.stacked_widget)
+
+        # Create pages
+        self.table_page = QWidget()
+        self.table_layout = QVBoxLayout(self.table_page)
+
+        # Create a QTableWidget
+        self.table = QTableWidget(self)
+        self.table.setRowCount(20)
+        self.table.setColumnCount(11)  # Updated column count
+        self.table_layout.addWidget(self.table)
+
+        self.second_page = QWidget()
+        self.second_layout = QVBoxLayout(self.second_page)
+        # Add the Gantt chart setup here
+        self.setup_gantt_chart()  # Call the setup method
+        # Add widgets to second page here as needed
+
+        # Add pages to stacked widget
+        self.stacked_widget.addWidget(self.table_page)
+        self.stacked_widget.addWidget(self.second_page)
+
+        # Create menu bar for page navigation
+        menubar = self.menuBar()
+        view_menu = menubar.addMenu('View')
+
+        # Add actions to switch pages
+        table_action = QAction('Table View', self)
+        table_action.triggered.connect(lambda: self.stacked_widget.setCurrentIndex(0))
+        view_menu.addAction(table_action)
+
+        second_action = QAction('Second Page', self)
+        second_action.triggered.connect(lambda: self.stacked_widget.setCurrentIndex(1))
+        view_menu.addAction(second_action)
+
+        # Set headers for the columns
+        headers = [
+            'ID', 'Name', 'Predecessor', 'Start Date', 'End Date', 'Duration (days)',
+            'Successors', 'Early Start', 'Early Finish', 'Late Start', 'Late Finish'
+        ]
+        self.table.setHorizontalHeaderLabels(headers)
+
+        # Initialize original names for indentation
+        self.original_names = [f"Activity {row + 1}" for row in range(self.table.rowCount())]
+
+        # Populate the table with default data
+        self.populate_table()
+
+        # Connect cell change event to handle calculations
+        self.table.itemChanged.connect(self.on_item_changed)
+
+        # Enable custom context menu
+        self.table.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.table.customContextMenuRequested.connect(self.show_context_menu)
+
+        # Zoom level management
+        self.default_font_size = 10
+        self.current_zoom_level = 0  # Tracks zoom level changes
+        self.update_zoom()
+
+        # Add zoom shortcuts
+        self.add_zoom_shortcuts()
+
+        # Track indentation levels
+        self.indentation_levels = [0] * self.table.rowCount()
+
+        # Add keyboard shortcuts for indent/outdent
+        self.add_indent_shortcuts()
+
+        # Add copy-paste functionality
+        self.add_copy_paste_shortcuts()
+
+        self.show()
+
+    def populate_table(self):
+        start_datetime = datetime(2024, 11, 15, 9, 0)  # Starting at 9:00 AM on Nov 15, 2024
+
+        for row in range(self.table.rowCount()):
+            # Column 0: ID
+            id_item = QTableWidgetItem(str(row + 1))
+            id_item.setFlags(Qt.ItemIsSelectable | Qt.ItemIsEnabled)
+            self.table.setItem(row, 0, id_item)
+
+            # Column 1: Name
+            name_item = QTableWidgetItem(self.original_names[row])
+            self.table.setItem(row, 1, name_item)
+
+            # Column 2: Predecessor
+            predecessor_text = ";".join(str(i + 1) for i in range(row)) if row > 0 else ""
+            predecessor_item = QTableWidgetItem(predecessor_text)
+            self.table.setItem(row, 2, predecessor_item)
+
+            # Column 3: Start Date
+            start_date_item = QDateTimeEdit(self)
+            start_date_item.setDateTime(QDateTime(start_datetime))
+            start_date_item.setDisplayFormat("yyyy-MM-dd HH:mm")
+            start_date_item.setCalendarPopup(True)
+            # Connect the dateTimeChanged signal
+            start_date_item.dateTimeChanged.connect(
+                lambda _, r=row, c=3: self.calculate_end_date(r, c)
+            )
+            self.table.setCellWidget(row, 3, start_date_item)
+
+            # Column 4: End Date (will be calculated)
+            end_date_item = QTableWidgetItem()
+            end_date_item.setFlags(Qt.ItemIsSelectable | Qt.ItemIsEnabled)
+            self.table.setItem(row, 4, end_date_item)
+
+            # Column 5: Duration (default duration is 1 day)
+            duration_item = QTableWidgetItem("1")
+            self.table.setItem(row, 5, duration_item)
+
+            # Column 6: Successors (will be calculated)
+            successors_item = QTableWidgetItem()
+            successors_item.setFlags(Qt.ItemIsSelectable | Qt.ItemIsEnabled)
+            self.table.setItem(row, 6, successors_item)
+
+            # Increment the start date for the next row
+            start_datetime += timedelta(days=1)
+
+            # Add new columns (7-10) for CPM calculations
+            for col in range(7, 11):
+                item = QTableWidgetItem("0")
+                item.setFlags(Qt.ItemIsSelectable | Qt.ItemIsEnabled)  # Make read-only
+                self.table.setItem(row, col, item)
+
+        # Initial calculations
+        self.calculate_all_end_dates()
+        self.calculate_successors()
+        self.calculate_cpm()
+
+    def on_item_changed(self, item):
+        # Identify which column changed
+        row = item.row()
+        column = item.column()
+        self.calculate_end_date(row, column)
+        if column in [2, 5]:  # If predecessor or duration changes
+            self.calculate_cpm()
+            self.update_gantt_chart()
+
+    def calculate_cpm(self):
+        # Initialize data structures
+        activities = {}
+
+        # Gather activity data
+        for row in range(self.table.rowCount()):
+            id_item = self.table.item(row, 0)
+            if not id_item or not id_item.text():
+                continue
+
+            activity_id = id_item.text()
+            duration_item = self.table.item(row, 5)
+            predecessor_item = self.table.item(row, 2)
+
+            # Robust duration parsing
+            try:
+                duration = int(duration_item.text())
+            except (ValueError, TypeError):
+                duration = 0
+
+            predecessors = predecessor_item.text().split(";") if predecessor_item and predecessor_item.text() else []
+            predecessors = [p for p in predecessors if p]  # Remove empty strings
+
+            activities[activity_id] = {
+                'duration': duration,
+                'predecessors': predecessors,
+                'early_start': 0,
+                'early_finish': 0,
+                'late_start': 0,
+                'late_finish': 0
+            }
+
+        # Forward pass - Calculate Early Start and Early Finish
+        def calculate_forward_pass():
+            for activity_id in activities:
+                act = activities[activity_id]
+                if not act['predecessors']:
+                    act['early_start'] = 0
+                    act['early_finish'] = act['duration']
+                else:
+                    act['early_start'] = max(
+                        activities[pred]['early_finish']
+                        for pred in act['predecessors']
+                        if pred in activities
+                    )
+                    act['early_finish'] = act['early_start'] + act['duration']
+
+        # Backward pass - Calculate Late Start and Late Finish
+        def calculate_backward_pass():
+            # Find the maximum early finish time
+            project_duration = max(act['early_finish'] for act in activities.values())
+
+            # Initialize late finish times to project duration
+            for activity_id in activities:
+                activities[activity_id]['late_finish'] = project_duration
+
+            # Find successors for each activity
+            successors = {aid: [] for aid in activities}
+            for aid, act in activities.items():
+                for pred in act['predecessors']:
+                    if pred in successors:
+                        successors[pred].append(aid)
+
+            # Backward pass
+            for activity_id in reversed(list(activities.keys())):
+                act = activities[activity_id]
+                if not successors[activity_id]:
+                    act['late_finish'] = project_duration
+                else:
+                    act['late_finish'] = min(
+                        activities[succ]['early_start']
+                        for succ in successors[activity_id]
+                    )
+                act['late_start'] = act['late_finish'] - act['duration']
+
+        # Perform CPM calculations
+        calculate_forward_pass()
+        calculate_backward_pass()
+
+        # Update the table with calculated values
+        for row in range(self.table.rowCount()):
+            id_item = self.table.item(row, 0)
+            if not id_item or not id_item.text():
+                continue
+
+            activity_id = id_item.text()
+            if activity_id in activities:
+                act = activities[activity_id]
+
+                # Update Early Start (column 7)
+                early_start_item = self.table.item(row, 7)
+                if early_start_item:
+                    early_start_item.setText(str(act['early_start']))
+                else:
+                    early_start_item = QTableWidgetItem(str(act['early_start']))
+                    early_start_item.setFlags(Qt.ItemIsSelectable | Qt.ItemIsEnabled)
+                    self.table.setItem(row, 7, early_start_item)
+
+                # Update Early Finish (column 8)
+                early_finish_item = self.table.item(row, 8)
+                if early_finish_item:
+                    early_finish_item.setText(str(act['early_finish']))
+                else:
+                    early_finish_item = QTableWidgetItem(str(act['early_finish']))
+                    early_finish_item.setFlags(Qt.ItemIsSelectable | Qt.ItemIsEnabled)
+                    self.table.setItem(row, 8, early_finish_item)
+
+                # Update Late Start (column 9)
+                late_start_item = self.table.item(row, 9)
+                if late_start_item:
+                    late_start_item.setText(str(act['late_start']))
+                else:
+                    late_start_item = QTableWidgetItem(str(act['late_start']))
+                    late_start_item.setFlags(Qt.ItemIsSelectable | Qt.ItemIsEnabled)
+                    self.table.setItem(row, 9, late_start_item)
+
+                # Update Late Finish (column 10)
+                late_finish_item = self.table.item(row, 10)
+                if late_finish_item:
+                    late_finish_item.setText(str(act['late_finish']))
+                else:
+                    late_finish_item = QTableWidgetItem(str(act['late_finish']))
+                    late_finish_item.setFlags(Qt.ItemIsSelectable | Qt.ItemIsEnabled)
+                    self.table.setItem(row, 10, late_finish_item)
+
+    def calculate_end_date(self, row, column):
+        if column == 3 or column == 5:  # If start date or duration changes
+            start_widget = self.table.cellWidget(row, 3)
+            start_date = start_widget.dateTime().toPyDateTime() if start_widget else None
+            duration_item = self.table.item(row, 5)
+            try:
+                duration = int(duration_item.text()) if duration_item and duration_item.text() else 0
+            except (ValueError, TypeError):
+                duration = 0
+
+            if start_date and duration:
+                end_date = start_date + timedelta(days=duration)
+                end_date_item = self.table.item(row, 4)
+                if end_date_item:
+                    end_date_item.setText(end_date.strftime("%Y-%m-%d %H:%M"))
+                else:
+                    end_date_item = QTableWidgetItem(end_date.strftime("%Y-%m-%d %H:%M"))
+                    end_date_item.setFlags(Qt.ItemIsSelectable | Qt.ItemIsEnabled)
+                    self.table.setItem(row, 4, end_date_item)
+
+                # Update successor start dates
+                task_id = row + 1  # Assuming task IDs start at 1
+                self.update_successor_start_dates(task_id, end_date)
+
+        # Recalculate successors when Predecessor changes
+        if column == 2:
+            self.calculate_successors()
+            self.update_dependent_start_dates()
+
+    def calculate_all_end_dates(self):
+        for row in range(self.table.rowCount()):
+            start_widget = self.table.cellWidget(row, 3)
+            duration_item = self.table.item(row, 5)
+            if start_widget and duration_item:
+                start_date = start_widget.dateTime().toPyDateTime()
+                try:
+                    duration = int(duration_item.text())
+                except (ValueError, TypeError):
+                    duration = 0
+                end_date = start_date + timedelta(days=duration)
+                end_date_item = self.table.item(row, 4)
+                if end_date_item:
+                    end_date_item.setText(end_date.strftime("%Y-%m-%d %H:%M"))
+                else:
+                    end_date_item = QTableWidgetItem(end_date.strftime("%Y-%m-%d %H:%M"))
+                    end_date_item.setFlags(Qt.ItemIsSelectable | Qt.ItemIsEnabled)
+                    self.table.setItem(row, 4, end_date_item)
+
+    def calculate_successors(self):
+        for row in range(self.table.rowCount()):
+            predecessors_item = self.table.item(row, 2)
+            successors = []
+            if predecessors_item and predecessors_item.text():
+                predecessors = predecessors_item.text().split(';')
+                for pred in predecessors:
+                    pred = pred.strip()
+                    if pred:
+                        # Find successors where current row's ID is a predecessor
+                        current_id = str(row + 1)
+                        for other_row in range(self.table.rowCount()):
+                            if other_row == row:
+                                continue
+                            other_predecessors_item = self.table.item(other_row, 2)
+                            if other_predecessors_item and current_id in other_predecessors_item.text().split(';'):
+                                if str(other_row + 1) not in successors:
+                                    successors.append(str(other_row + 1))
+            successors_text = ';'.join(successors)
+            successors_item = self.table.item(row, 6)
+            if successors_item:
+                successors_item.setText(successors_text)
+            else:
+                successors_item = QTableWidgetItem(successors_text)
+                successors_item.setFlags(Qt.ItemIsSelectable | Qt.ItemIsEnabled)
+                self.table.setItem(row, 6, successors_item)
+
+    def update_successor_start_dates(self, task_id, end_date):
+        """
+        Updates the start dates of all successor tasks based on the new end_date of the given task_id.
+        """
+        # Iterate through all rows to find successors
+        for row in range(self.table.rowCount()):
+            predecessor_item = self.table.item(row, 2)
+            if predecessor_item and str(task_id) in predecessor_item.text().split(';'):
+                # Get all predecessors for this task
+                predecessors = predecessor_item.text().split(';')
+
+                # Find the latest end date among all predecessors
+                latest_end_date = end_date
+                for pred_id in predecessors:
+                    if pred_id:
+                        pred_row = int(pred_id) - 1
+                        pred_end_date_item = self.table.item(pred_row, 4)
+                        if pred_end_date_item and pred_end_date_item.text():
+                            try:
+                                pred_end_date = datetime.strptime(pred_end_date_item.text(), "%Y-%m-%d %H:%M")
+                                if pred_end_date > latest_end_date:
+                                    latest_end_date = pred_end_date
+                            except ValueError:
+                                continue
+
+                # Update the start date if necessary
+                start_widget = self.table.cellWidget(row, 3)
+                if start_widget:
+                    current_start = start_widget.dateTime().toPyDateTime()
+                    if latest_end_date > current_start:
+                        start_widget.blockSignals(True)  # Prevent triggering signals
+                        start_widget.setDateTime(QDateTime(latest_end_date))
+                        start_widget.blockSignals(False)
+
+                        # Trigger recalculation of end date for this task
+                        self.calculate_end_date(row, 3)
+
+    def update_dependent_start_dates(self):
+        """
+        Updates the start dates for all tasks based on their predecessors' end dates.
+        This ensures consistency across the entire task chain.
+        """
+        for row in range(self.table.rowCount()):
+            predecessor_item = self.table.item(row, 2)
+            if predecessor_item and predecessor_item.text():
+                predecessors = predecessor_item.text().split(';')
+                latest_end_date = None
+
+                # Find the latest end date among predecessors
+                for pred_id in predecessors:
+                    if pred_id:
+                        pred_row = int(pred_id) - 1
+                        pred_end_date_item = self.table.item(pred_row, 4)
+                        if pred_end_date_item and pred_end_date_item.text():
+                            try:
+                                pred_end_date = datetime.strptime(pred_end_date_item.text(), "%Y-%m-%d %H:%M")
+                                if (latest_end_date is None) or (pred_end_date > latest_end_date):
+                                    latest_end_date = pred_end_date
+                            except ValueError:
+                                continue
+
+                # Update start date if necessary
+                if latest_end_date:
+                    start_widget = self.table.cellWidget(row, 3)
+                    if start_widget:
+                        current_start = start_widget.dateTime().toPyDateTime()
+                        if latest_end_date > current_start:
+                            start_widget.blockSignals(True)  # Prevent triggering signals
+                            start_widget.setDateTime(QDateTime(latest_end_date))
+                            start_widget.blockSignals(False)
+
+                            # Recalculate end date for this task
+                            self.calculate_end_date(row, 3)
+
+    def show_context_menu(self, position):
+        menu = QMenu()
+
+        # Indent/Outdent actions
+        indent_action = menu.addAction("Indent")
+        outdent_action = menu.addAction("Outdent")
+
+        # Copy, Paste, and Delete actions
+        copy_action = menu.addAction("Copy")
+        paste_action = menu.addAction("Paste")
+        delete_action = menu.addAction("Delete")
+
+        # Connect actions to their functions
+        indent_action.triggered.connect(self.indent_row)
+        outdent_action.triggered.connect(self.outdent_row)
+        copy_action.triggered.connect(self.copy_selected_cells)
+        paste_action.triggered.connect(self.paste_to_selected_cells)
+        delete_action.triggered.connect(self.delete_selected_cells)
+
+        menu.exec_(self.table.viewport().mapToGlobal(position))
+
+    def delete_selected_cells(self):
+        for item in self.table.selectedItems():
+            if item.column() != 0 and item.column() != 7 and item.column() != 8 and item.column() != 9 and item.column() != 10:
+                # Do not allow deletion of ID and CPM related columns
+                item.setText("")
+
+    def indent_row(self):
+        for item in self.table.selectedItems():
+            row = item.row()
+            self.indentation_levels[row] += 1
+            self.update_row_indentation(row)
+
+    def outdent_row(self):
+        for item in self.table.selectedItems():
+            row = item.row()
+            if self.indentation_levels[row] > 0:
+                self.indentation_levels[row] -= 1
+                self.update_row_indentation(row)
+
+    def update_row_indentation(self, row):
+        name_item = self.table.item(row, 1)
+        if name_item:
+            indentation = "    " * self.indentation_levels[row]  # 4 spaces per indentation level
+            name_item.setText(f"{indentation}{self.original_names[row]}")
+
+    def add_zoom_shortcuts(self):
+        zoom_in_shortcut = QAction("Zoom In", self)
+        zoom_in_shortcut.setShortcut(QKeySequence("Ctrl++"))
+        zoom_in_shortcut.triggered.connect(self.zoom_in)
+
+        zoom_out_shortcut = QAction("Zoom Out", self)
+        zoom_out_shortcut.setShortcut(QKeySequence("Ctrl+-"))
+        zoom_out_shortcut.triggered.connect(self.zoom_out)
+
+        reset_zoom_shortcut = QAction("Reset Zoom", self)
+        reset_zoom_shortcut.setShortcut(QKeySequence("Ctrl+0"))
+        reset_zoom_shortcut.triggered.connect(self.reset_zoom)
+
+        self.addAction(zoom_in_shortcut)
+        self.addAction(zoom_out_shortcut)
+        self.addAction(reset_zoom_shortcut)
+
+    def add_indent_shortcuts(self):
+        indent_shortcut = QAction("Indent", self)
+        indent_shortcut.setShortcut(QKeySequence(Qt.Key_Tab))
+        indent_shortcut.triggered.connect(self.indent_row)
+
+        outdent_shortcut = QAction("Outdent", self)
+        outdent_shortcut.setShortcut(QKeySequence(Qt.Key_Backtab))
+        outdent_shortcut.triggered.connect(self.outdent_row)
+
+        self.addAction(indent_shortcut)
+        self.addAction(outdent_shortcut)
+
+    def add_copy_paste_shortcuts(self):
+        copy_action = QAction("Copy", self)
+        copy_action.setShortcut(QKeySequence.Copy)
+        copy_action.triggered.connect(self.copy_selected_cells)
+
+        paste_action = QAction("Paste", self)
+        paste_action.setShortcut(QKeySequence.Paste)
+        paste_action.triggered.connect(self.paste_to_selected_cells)
+
+        self.addAction(copy_action)
+        self.addAction(paste_action)
+
+    def copy_selected_cells(self):
+        selection = self.table.selectedRanges()
+        if not selection:
+            return
+
+        selected_data = []
+        for range_ in selection:
+            for row in range(range_.topRow(), range_.bottomRow() + 1):
+                row_data = []
+                for col in range(range_.leftColumn(), range_.rightColumn() + 1):
+                    if col == 3:
+                        # QDateTimeEdit
+                        widget = self.table.cellWidget(row, col)
+                        if isinstance(widget, QDateTimeEdit):
+                            cell_text = widget.dateTime().toString("yyyy-MM-dd HH:mm")
+                        else:
+                            item = self.table.item(row, col)
+                            cell_text = item.text() if item else ""
+                    else:
+                        item = self.table.item(row, col)
+                        cell_text = item.text() if item else ""
+                    row_data.append(cell_text)
+                selected_data.append("\t".join(row_data))
+        clipboard = QApplication.clipboard()
+        clipboard.setText("\n".join(selected_data))
+
+    def paste_to_selected_cells(self):
+        clipboard = QApplication.clipboard()
+        data = clipboard.text().splitlines()
+        selected_range = self.table.selectedRanges()
+        if not selected_range:
+            return
+
+        start_row = selected_range[0].topRow()
+        start_col = selected_range[0].leftColumn()
+
+        for r, line in enumerate(data):
+            for c, cell_data in enumerate(line.split("\t")):
+                target_row = start_row + r
+                target_col = start_col + c
+                if target_row < self.table.rowCount() and target_col < self.table.columnCount():
+                    if target_col == 3:
+                        # QDateTimeEdit
+                        widget = self.table.cellWidget(target_row, target_col)
+                        try:
+                            dt = datetime.strptime(cell_data, "%Y-%m-%d %H:%M")
+                            widget.setDateTime(QDateTime(dt))
+                        except ValueError:
+                            pass  # Ignore invalid date formats
+                    else:
+                        item = self.table.item(target_row, target_col)
+                        if not item:
+                            item = QTableWidgetItem()
+                            self.table.setItem(target_row, target_col, item)
+                        # Prevent modifying ID and CPM columns
+                        if target_col != 0 and target_col >= 1 and target_col <= 6:
+                            item.setText(cell_data)
+        # After pasting, recalculate CPM and update Gantt chart
+        self.calculate_cpm()
+        self.update_gantt_chart()
+
+    def zoom_in(self):
+        MAX_ZOOM_LEVEL = 20
+        if self.current_zoom_level < MAX_ZOOM_LEVEL:
+            self.current_zoom_level += 1
+            self.update_zoom()
+
+    def zoom_out(self):
+        MIN_ZOOM_LEVEL = -5
+        if self.current_zoom_level > MIN_ZOOM_LEVEL:
+            self.current_zoom_level -= 1
+            self.update_zoom()
+
+    def reset_zoom(self):
+        self.current_zoom_level = 0
+        self.update_zoom()
+
+    def update_zoom(self):
+        font = QFont()
+        new_font_size = self.default_font_size + self.current_zoom_level
+        new_font_size = max(6, min(new_font_size, 30))  # Limit font size
+        font.setPointSize(new_font_size)
+        self.table.setFont(font)
+
+    def setup_gantt_chart(self):
+        # Create a figure and canvas for the Gantt chart
+        self.figure = Figure(figsize=(12, 6))
+        self.canvas = FigureCanvas(self.figure)
+        self.second_layout.addWidget(self.canvas)
+
+        # Add navigation toolbar (optional)
+        from matplotlib.backends.backend_qt5agg import NavigationToolbar2QT as NavigationToolbar
+        self.toolbar = NavigationToolbar(self.canvas, self)
+        self.second_layout.addWidget(self.toolbar)
+
+        # Add refresh button
+        refresh_btn = QPushButton("Refresh Gantt Chart")
+        refresh_btn.clicked.connect(self.update_gantt_chart)
+        self.second_layout.addWidget(refresh_btn)
+
+        # Add custom zoom buttons
+        self.add_custom_zoom_buttons()
+
+        # Initial chart update
+        self.update_gantt_chart()
+
+    def add_custom_zoom_buttons(self):
+        zoom_controls_layout = QHBoxLayout()
+
+        zoom_in_btn = QPushButton("Zoom In")
+        zoom_in_btn.clicked.connect(self.zoom_in_gantt)
+        zoom_controls_layout.addWidget(zoom_in_btn)
+
+        zoom_out_btn = QPushButton("Zoom Out")
+        zoom_out_btn.clicked.connect(self.zoom_out_gantt)
+        zoom_controls_layout.addWidget(zoom_out_btn)
+
+        self.second_layout.addLayout(zoom_controls_layout)
+
+    def zoom_in_gantt(self):
+        ax = self.figure.axes[0]
+        x_min, x_max = ax.get_xlim()
+        zoom_factor = 0.8  # 80% of the current range
+        new_width = (x_max - x_min) * zoom_factor
+        center = (x_max + x_min) / 2
+        ax.set_xlim(center - new_width / 2, center + new_width / 2)
+        self.canvas.draw()
+
+    def zoom_out_gantt(self):
+        ax = self.figure.axes[0]
+        x_min, x_max = ax.get_xlim()
+        zoom_factor = 1.25  # 125% of the current range
+        new_width = (x_max - x_min) * zoom_factor
+        center = (x_max + x_min) / 2
+        ax.set_xlim(center - new_width / 2, center + new_width / 2)
+        self.canvas.draw()
+
+    def update_gantt_chart(self):
+        # Clear the figure
+        self.figure.clear()
+
+        # Get data from table
+        tasks = []
+        start_dates = []
+        end_dates = []
+
+        for row in range(self.table.rowCount()):
+            name_item = self.table.item(row, 1)
+            if not name_item or not name_item.text().strip():
+                continue
+
+            start_widget = self.table.cellWidget(row, 3)
+            if not start_widget:
+                continue
+            start_date = start_widget.dateTime().toPyDateTime()
+
+            end_item = self.table.item(row, 4)
+            if not end_item or not end_item.text():
+                continue
+            try:
+                end_date = datetime.strptime(end_item.text(), "%Y-%m-%d %H:%M")
+            except ValueError:
+                continue
+
+            tasks.append(name_item.text())
+            start_dates.append(mdates.date2num(start_date))
+            end_dates.append(mdates.date2num(end_date))
+
+        if not tasks:
+            ax = self.figure.add_subplot(111)
+            ax.text(0.5, 0.5, 'No tasks available to display.', 
+                    horizontalalignment='center', verticalalignment='center')
+            ax.axis('off')
+            self.canvas.draw()
+            return
+
+        # Create Gantt chart
+        ax = self.figure.add_subplot(111)
+
+        # Calculate durations
+        durations = [end - start for start, end in zip(start_dates, end_dates)]
+
+        # Plot bars
+        y_positions = range(len(tasks))
+        ax.barh(y_positions, durations, left=start_dates, height=0.3, align='center')
+
+        # Customize chart
+        ax.set_yticks(y_positions)
+        ax.set_yticklabels(tasks)
+        ax.xaxis_date()
+        ax.xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m-%d'))
+        ax.xaxis.set_major_locator(mdates.WeekdayLocator(interval=1))  # Adjust interval as needed
+
+        for label in ax.get_xticklabels():
+            label.set_rotation(45)
+            label.set_horizontalalignment('right')  # Improve readability
+
+        ax.grid(True)
+        ax.set_title('Project Gantt Chart')
+
+        # Adjust x-axis limits to fit all tasks with padding
+        min_date = min(start_dates)
+        max_date = max(end_dates)
+        padding = 5  # days
+        min_date_num = min_date - padding
+        max_date_num = max_date + padding
+        ax.set_xlim(min_date_num, max_date_num)
+
+        # Adjust layout and redraw
+        self.figure.tight_layout()
+        self.canvas.draw()
+
+    def indent_row(self):
+        for item in self.table.selectedItems():
+            row = item.row()
+            self.indentation_levels[row] += 1
+            self.update_row_indentation(row)
+
+    def outdent_row(self):
+        for item in self.table.selectedItems():
+            row = item.row()
+            if self.indentation_levels[row] > 0:
+                self.indentation_levels[row] -= 1
+                self.update_row_indentation(row)
+
+
+if __name__ == "__main__":
+    app = QApplication(sys.argv)
+    window = ActivityTableApp()
+    sys.exit(app.exec_())
+    
