@@ -1,0 +1,707 @@
+import sys
+from PyQt5.QtWidgets import (
+    QApplication, QMainWindow, QDateTimeEdit, QMenu, QVBoxLayout, QWidget, 
+    QAction, QPushButton, QHBoxLayout, QMessageBox, QTableView, QHeaderView,
+    QAbstractScrollArea, QTabWidget, QStyledItemDelegate
+)
+from PyQt5.QtCore import Qt, QDateTime, QAbstractTableModel, QModelIndex, QVariant
+from PyQt5.QtGui import QFont, QKeySequence
+from datetime import datetime, timedelta
+from matplotlib.figure import Figure
+from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
+import matplotlib.dates as mdates
+
+class ActivityTableModel(QAbstractTableModel):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.headers = [
+            'ID', 'Name', 'Predecessor', 'Start Date', 'End Date', 'Duration',
+            'Successors', 'Early Start', 'Early Finish', 'Late Start', 'Late Finish'
+        ]
+        self._data = []
+        self.datetime_column = 3  # Start Date column
+
+    def rowCount(self, parent=None):
+        return len(self._data)
+
+    def columnCount(self, parent=None):
+        return len(self.headers)
+
+    def data(self, index, role=Qt.DisplayRole):
+        if not index.isValid():
+            return None
+            
+        row = index.row()
+        column = index.column()
+        value = self._data[row][column]
+        
+        if role == Qt.DisplayRole or role == Qt.EditRole:
+            if column == self.datetime_column and isinstance(value, QDateTime):
+                return value.toString("yyyy-MM-dd HH:mm")
+            return str(value)
+            
+        return None
+
+    def setData(self, index, value, role=Qt.EditRole):
+        if not index.isValid():
+            return False
+            
+        row = index.row()
+        column = index.column()
+
+        if role == Qt.EditRole:
+            if column == self.datetime_column and isinstance(value, QDateTime):
+                self._data[row][column] = value
+            else:
+                self._data[row][column] = value
+            self.dataChanged.emit(index, index, [role])
+            return True
+            
+        return False
+
+    def headerData(self, section, orientation, role=Qt.DisplayRole):
+        if role == Qt.DisplayRole and orientation == Qt.Horizontal:
+            return self.headers[section]
+        return None
+
+    def flags(self, index):
+        if not index.isValid():
+            return Qt.NoItemFlags
+            
+        column = index.column()
+        # Make certain columns read-only
+        if column in [4, 6, 7, 8, 9, 10]:  # End Date, Successors, and CPM columns
+            return Qt.ItemIsEnabled | Qt.ItemIsSelectable
+            
+        return Qt.ItemIsEnabled | Qt.ItemIsSelectable | Qt.ItemIsEditable
+
+    def insertRows(self, position, rows, parent=QModelIndex()):
+        self.beginInsertRows(parent, position, position + rows - 1)
+        for _ in range(rows):
+            empty_row = [""] * len(self.headers)
+            empty_row[self.datetime_column] = QDateTime.currentDateTime()
+            empty_row[4] = QDateTime.currentDateTime().toString("yyyy-MM-dd HH:mm")  # Initialize End Date
+            self._data.insert(position, empty_row)
+        self.endInsertRows()
+        return True
+
+    def removeRows(self, position, rows, parent=QModelIndex()):
+        self.beginRemoveRows(parent, position, position + rows - 1)
+        del self._data[position:position + rows]
+        self.endRemoveRows()
+        return True
+
+    def get_all_data(self):
+        return self._data
+
+    def set_all_data(self, data):
+        self.beginResetModel()
+        self._data = data
+        self.endResetModel()
+
+class ActivityTableApp(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        
+        # Window setup
+        self.setWindowTitle("Activity Table with Hierarchy and CPM")
+        self.setGeometry(100, 100, 1200, 600)
+        self.setWindowFlags(Qt.Window)
+        
+        # Create model
+        self.model = ActivityTableModel()
+
+        # Create central widget and main layout
+        self.central_widget = QWidget()
+        self.setCentralWidget(self.central_widget)
+        self.main_layout = QVBoxLayout(self.central_widget)
+
+        # Create QTabWidget
+        self.tabs = QTabWidget()
+        self.main_layout.addWidget(self.tabs)
+
+        # Create Table Tab
+        self.table_tab = QWidget()
+        self.table_layout = QVBoxLayout(self.table_tab)
+        
+        # Create the table view
+        self.table_view = QTableView(self)
+        self.table_view.setModel(self.model)
+        # Make headers resize properly
+        self.table_view.horizontalHeader().setStretchLastSection(True)
+        self.table_view.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
+        self.table_view.verticalHeader().setSectionResizeMode(QHeaderView.Interactive)
+        # Make table resize with window
+        self.table_view.setSizeAdjustPolicy(QAbstractScrollArea.AdjustToContents)
+        self.table_layout.addWidget(self.table_view)
+
+        # Set delegate for Start Date to use QDateTimeEdit
+        self.date_delegate = DateTimeDelegate()
+        self.table_view.setItemDelegateForColumn(3, self.date_delegate)
+
+        # Add control buttons to Table Tab
+        button_layout = QHBoxLayout()
+        self.add_row_button = QPushButton("Add Row")
+        self.add_row_button.clicked.connect(self.add_row)
+        self.remove_row_button = QPushButton("Remove Row")
+        self.remove_row_button.clicked.connect(self.remove_row)
+        button_layout.addWidget(self.add_row_button)
+        button_layout.addWidget(self.remove_row_button)
+        self.table_layout.addLayout(button_layout)
+
+        # Add Table Tab to QTabWidget
+        self.tabs.addTab(self.table_tab, "Table View")
+
+        # Create Gantt Chart Tab
+        self.gantt_tab = QWidget()
+        self.gantt_layout = QVBoxLayout(self.gantt_tab)
+        
+        # Setup Gantt chart within Gantt Tab
+        self.setup_gantt_chart()
+        self.gantt_layout.addWidget(self.canvas)
+        self.gantt_layout.addWidget(self.toolbar)
+
+        # Add Gantt Chart Tab to QTabWidget
+        self.tabs.addTab(self.gantt_tab, "Gantt Chart")
+
+        # Create menu bar
+        self.create_menu_bar()
+
+        # Add shortcuts for copy, paste, delete
+        self.copy_shortcut = QAction('Copy', self)
+        self.copy_shortcut.setShortcut(QKeySequence.Copy)
+        self.copy_shortcut.triggered.connect(self.copy_cells)
+        self.addAction(self.copy_shortcut)
+
+        self.paste_shortcut = QAction('Paste', self)
+        self.paste_shortcut.setShortcut(QKeySequence.Paste)
+        self.paste_shortcut.triggered.connect(self.paste_cells)
+        self.addAction(self.paste_shortcut)
+
+        self.delete_shortcut = QAction('Delete', self)
+        self.delete_shortcut.setShortcut(QKeySequence.Delete)
+        self.delete_shortcut.triggered.connect(self.delete_cells)
+        self.addAction(self.delete_shortcut)
+
+        # Add context menu
+        self.table_view.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.table_view.customContextMenuRequested.connect(self.show_context_menu)
+
+        # Initialize indentation tracking
+        self.indentation_levels = []
+        self.original_names = []
+
+        # Connect signals
+        self.model.dataChanged.connect(self.on_data_changed)
+
+    def create_menu_bar(self):
+        menubar = self.menuBar()
+        view_menu = menubar.addMenu('View')
+
+        table_action = QAction('Table View', self)
+        table_action.triggered.connect(lambda: self.tabs.setCurrentWidget(self.table_tab))
+        view_menu.addAction(table_action)
+
+        gantt_action = QAction('Gantt Chart', self)
+        gantt_action.triggered.connect(lambda: self.tabs.setCurrentWidget(self.gantt_tab))
+        view_menu.addAction(gantt_action)
+
+    def setup_gantt_chart(self):
+        self.figure = Figure(figsize=(12, 6))
+        self.canvas = FigureCanvas(self.figure)
+
+        from matplotlib.backends.backend_qt5agg import NavigationToolbar2QT as NavigationToolbar
+        self.toolbar = NavigationToolbar(self.canvas, self)
+
+        refresh_btn = QPushButton("Refresh Gantt Chart")
+        refresh_btn.clicked.connect(self.update_gantt_chart)
+        self.gantt_layout.addWidget(refresh_btn)
+
+        self.add_custom_zoom_buttons()
+
+    def add_custom_zoom_buttons(self):
+        zoom_controls_layout = QHBoxLayout()
+        
+        zoom_in_btn = QPushButton("Zoom In")
+        zoom_in_btn.clicked.connect(self.zoom_in_gantt)
+        zoom_controls_layout.addWidget(zoom_in_btn)
+
+        zoom_out_btn = QPushButton("Zoom Out")
+        zoom_out_btn.clicked.connect(self.zoom_out_gantt)
+        zoom_controls_layout.addWidget(zoom_out_btn)
+
+        self.gantt_layout.addLayout(zoom_controls_layout)
+
+    def add_row(self):
+        row_count = self.model.rowCount()
+        self.model.insertRows(row_count, 1)
+        self.indentation_levels.append(0)
+        self.original_names.append("")
+        self.calculate_cpm()
+        self.update_gantt_chart()
+
+    def remove_row(self):
+        selected_indexes = self.table_view.selectedIndexes()
+        if not selected_indexes:
+            QMessageBox.information(self, "Remove Row", "Please select one or more rows to remove.")
+            return
+
+        rows_to_remove = sorted(set(index.row() for index in selected_indexes), reverse=True)
+        for row in rows_to_remove:
+            self.model.removeRows(row, 1)
+            if row < len(self.indentation_levels):
+                del self.indentation_levels[row]
+                del self.original_names[row]
+
+        self.calculate_cpm()
+        self.update_gantt_chart()
+
+    def on_data_changed(self, topLeft, bottomRight, roles):
+        if not roles or Qt.EditRole in roles:
+            row = topLeft.row()
+            column = topLeft.column()
+            
+            if column in [2, 5]:  # Predecessor or Duration changed
+                self.calculate_end_date(row)
+                self.calculate_cpm()
+                self.update_gantt_chart()
+            elif column == 3:  # Start Date changed
+                self.calculate_end_date(row)
+                self.update_dependent_start_dates()
+                self.calculate_cpm()
+                self.update_gantt_chart()
+
+    def calculate_end_date(self, row):
+        try:
+            start_date = self.model._data[row][3]  # Start Date
+            duration_str = self.model._data[row][5]  # Duration
+            
+            if isinstance(start_date, QDateTime) and duration_str:
+                try:
+                    duration = int(duration_str)
+                    start_datetime = start_date.toPyDateTime()
+                    end_datetime = start_datetime + timedelta(days=duration)
+                    
+                    # Update End Date column
+                    self.model._data[row][4] = end_datetime.strftime("%Y-%m-%d %H:%M")
+                    end_date_index = self.model.index(row, 4)
+                    self.model.dataChanged.emit(end_date_index, end_date_index, [Qt.DisplayRole])
+                    
+                    # Update successor start dates
+                    task_id = str(row + 1)  # Assuming task IDs start at 1
+                    self.update_successor_start_dates(task_id, end_datetime)
+                except ValueError:
+                    pass
+        except IndexError:
+            pass
+
+    def update_successor_start_dates(self, task_id, end_date):
+        for row in range(self.model.rowCount()):
+            predecessor_str = str(self.model._data[row][2])  # Predecessor column
+            if predecessor_str and task_id in predecessor_str.split(';'):
+                predecessors = predecessor_str.split(';')
+                latest_end_date = end_date
+
+                # Find the latest end date among all predecessors
+                for pred_id in predecessors:
+                    if pred_id.strip():
+                        try:
+                            pred_row = int(pred_id.strip()) - 1
+                            pred_end_date_str = self.model._data[pred_row][4]  # End Date
+                            if pred_end_date_str:
+                                pred_end_date = datetime.strptime(pred_end_date_str, "%Y-%m-%d %H:%M")
+                                if pred_end_date > latest_end_date:
+                                    latest_end_date = pred_end_date
+                        except (ValueError, IndexError):
+                            continue
+
+                # Update the start date
+                current_start = self.model._data[row][3]  # Start Date
+                if isinstance(current_start, QDateTime):
+                    current_start_py = current_start.toPyDateTime()
+                    if latest_end_date > current_start_py:
+                        new_start = QDateTime.fromString(
+                            latest_end_date.strftime("%Y-%m-%d %H:%M"),
+                            "yyyy-MM-dd HH:mm"
+                        )
+                        self.model._data[row][3] = new_start
+                        start_index = self.model.index(row, 3)
+                        self.model.dataChanged.emit(start_index, start_index, [Qt.DisplayRole])
+                        self.calculate_end_date(row)
+
+    def update_dependent_start_dates(self):
+        for row in range(self.model.rowCount()):
+            predecessor_str = str(self.model._data[row][2])  # Predecessor column
+            if predecessor_str:
+                predecessors = predecessor_str.split(';')
+                latest_end_date = None
+
+                for pred_id in predecessors:
+                    if pred_id.strip():
+                        try:
+                            pred_row = int(pred_id.strip()) - 1
+                            pred_end_date_str = self.model._data[pred_row][4]  # End Date
+                            if pred_end_date_str:
+                                pred_end_date = datetime.strptime(pred_end_date_str, "%Y-%m-%d %H:%M")
+                                if latest_end_date is None or pred_end_date > latest_end_date:
+                                    latest_end_date = pred_end_date
+                        except (ValueError, IndexError):
+                            continue
+
+                if latest_end_date:
+                    current_start = self.model._data[row][3]  # Start Date
+                    if isinstance(current_start, QDateTime):
+                        current_start_py = current_start.toPyDateTime()
+                        if latest_end_date > current_start_py:
+                            new_start = QDateTime.fromString(
+                                latest_end_date.strftime("%Y-%m-%d %H:%M"),
+                                "yyyy-MM-dd HH:mm"
+                            )
+                            self.model._data[row][3] = new_start
+                            start_index = self.model.index(row, 3)
+                            self.model.dataChanged.emit(start_index, start_index, [Qt.DisplayRole])
+                            self.calculate_end_date(row)
+
+    def calculate_successors(self):
+        for row in range(self.model.rowCount()):
+            current_id = str(row + 1)
+            successors = []
+            
+            # Find all tasks that have this task as a predecessor
+            for other_row in range(self.model.rowCount()):
+                if other_row != row:
+                    predecessor_str = str(self.model._data[other_row][2])
+                    if predecessor_str and current_id in predecessor_str.split(';'):
+                        successors.append(str(other_row + 1))
+
+            # Update Successors column
+            successors_text = ';'.join(successors)
+            self.model._data[row][6] = successors_text
+            successor_index = self.model.index(row, 6)
+            self.model.dataChanged.emit(successor_index, successor_index, [Qt.DisplayRole])
+
+    def calculate_cpm(self):
+        # Initialize data structures
+        activities = {}
+
+        # Gather activity data
+        for row in range(self.model.rowCount()):
+            activity_id = str(row + 1)  # Convert row index to ID
+            duration_str = str(self.model._data[row][5])  # Duration
+            predecessor_str = str(self.model._data[row][2])  # Predecessor
+
+            try:
+                duration = int(duration_str) if duration_str else 0
+            except ValueError:
+                duration = 0
+
+            predecessors = [p.strip() for p in predecessor_str.split(";") if p.strip()]
+
+            activities[activity_id] = {
+                'duration': duration,
+                'predecessors': predecessors,
+                'successors': [],
+                'early_start': 0,
+                'early_finish': 0,
+                'late_start': 0,
+                'late_finish': 0
+            }
+
+        # Determine successors
+        for activity_id, data in activities.items():
+            for predecessor_id in data['predecessors']:
+                if predecessor_id in activities:
+                    activities[predecessor_id]['successors'].append(activity_id)
+
+        # Topological sort
+        sorted_activities = []
+        temp_mark = set()
+        perm_mark = set()
+
+        def visit(n):
+            if n in perm_mark:
+                return
+            if n in temp_mark:
+                raise Exception("Cycle detected in dependencies.")
+            temp_mark.add(n)
+            for m in activities[n]['predecessors']:
+                if m in activities:
+                    visit(m)
+            temp_mark.remove(n)
+            perm_mark.add(n)
+            sorted_activities.append(n)
+
+        try:
+            for activity_id in activities:
+                if activity_id not in perm_mark:
+                    visit(activity_id)
+        except Exception as e:
+            QMessageBox.critical(self, "CPM Error", str(e))
+            return
+
+        # Forward pass - Calculate Early Start (ES) and Early Finish (EF)
+        es = {}
+        ef = {}
+        for activity_id in sorted_activities:
+            predecessors = activities[activity_id]['predecessors']
+            if not predecessors:
+                es[activity_id] = 0
+            else:
+                es[activity_id] = max(ef[p] for p in predecessors if p in ef) if predecessors else 0
+            ef[activity_id] = es[activity_id] + activities[activity_id]['duration']
+
+        # Backward pass - Calculate Late Start (LS) and Late Finish (LF)
+        ls = {}
+        lf = {}
+        max_ef = max(ef.values()) if ef else 0
+        for activity_id in reversed(sorted_activities):
+            successors = activities[activity_id]['successors']
+            if not successors:
+                lf[activity_id] = max_ef
+            else:
+                lf[activity_id] = min(ls[s] for s in successors if s in ls)
+            ls[activity_id] = lf[activity_id] - activities[activity_id]['duration']
+
+        # Update model with CPM calculations
+        for activity_id, data in activities.items():
+            row = int(activity_id) - 1
+            
+            # Update Early Start
+            self.model._data[row][7] = str(es.get(activity_id, ""))
+            es_index = self.model.index(row, 7)
+            self.model.dataChanged.emit(es_index, es_index, [Qt.DisplayRole])
+
+            # Update Early Finish
+            self.model._data[row][8] = str(ef.get(activity_id, ""))
+            ef_index = self.model.index(row, 8)
+            self.model.dataChanged.emit(ef_index, ef_index, [Qt.DisplayRole])
+
+            # Update Late Start
+            self.model._data[row][9] = str(ls.get(activity_id, ""))
+            ls_index = self.model.index(row, 9)
+            self.model.dataChanged.emit(ls_index, ls_index, [Qt.DisplayRole])
+
+            # Update Late Finish
+            self.model._data[row][10] = str(lf.get(activity_id, ""))
+            lf_index = self.model.index(row, 10)
+            self.model.dataChanged.emit(lf_index, lf_index, [Qt.DisplayRole])
+
+            # Update Successors
+            successors_text = ";".join(activities[activity_id]['successors'])
+            self.model._data[row][6] = successors_text
+            succ_index = self.model.index(row, 6)
+            self.model.dataChanged.emit(succ_index, succ_index, [Qt.DisplayRole])
+
+    def show_context_menu(self, position):
+        menu = QMenu()
+
+        copy_action = menu.addAction("Copy")
+        paste_action = menu.addAction("Paste")
+        delete_action = menu.addAction("Delete")
+
+        action = menu.exec_(self.table_view.viewport().mapToGlobal(position))
+        if action == copy_action:
+            self.copy_cells()
+        elif action == paste_action:
+            self.paste_cells()
+        elif action == delete_action:
+            self.delete_cells()
+
+    def copy_cells(self):
+        selected_indexes = self.table_view.selectionModel().selectedIndexes()
+        if not selected_indexes:
+            return
+
+        # Sort selected indexes
+        selected_indexes = sorted(selected_indexes, key=lambda x: (x.row(), x.column()))
+        
+        # Determine the range
+        start_row = selected_indexes[0].row()
+        start_col = selected_indexes[0].column()
+        end_row = selected_indexes[-1].row()
+        end_col = selected_indexes[-1].column()
+
+        # Extract data
+        clipboard_text = ""
+        for row in range(start_row, end_row + 1):
+            row_data = []
+            for col in range(start_col, end_col + 1):
+                index = self.model.index(row, col)
+                data = self.model.data(index, Qt.DisplayRole)
+                row_data.append(data if data else "")
+            clipboard_text += '\t'.join(row_data) + '\n'
+
+        # Set clipboard
+        clipboard = QApplication.clipboard()
+        clipboard.setText(clipboard_text.strip())
+
+    def paste_cells(self):
+        clipboard = QApplication.clipboard()
+        text = clipboard.text()
+        if not text:
+            return
+
+        selected_indexes = self.table_view.selectionModel().selectedIndexes()
+        if not selected_indexes:
+            return
+
+        # Determine starting point
+        start_row = selected_indexes[0].row()
+        start_col = selected_indexes[0].column()
+
+        # Split clipboard text into rows and columns
+        rows = text.split('\n')
+        for i, row_text in enumerate(rows):
+            columns = row_text.split('\t')
+            for j, cell_text in enumerate(columns):
+                row = start_row + i
+                col = start_col + j
+
+                if row >= self.model.rowCount() or col >= self.model.columnCount():
+                    continue  # Skip if out of bounds
+
+                if col in [4, 6, 7, 8, 9, 10]:
+                    continue  # Skip read-only columns
+
+                index = self.model.index(row, col)
+                if col == 3:  # Start Date column
+                    date = QDateTime.fromString(cell_text, "yyyy-MM-dd HH:mm")
+                    if date.isValid():
+                        self.model.setData(index, date, Qt.EditRole)
+                else:
+                    self.model.setData(index, cell_text, Qt.EditRole)
+
+    def delete_cells(self):
+        selected_indexes = self.table_view.selectionModel().selectedIndexes()
+        if not selected_indexes:
+            return
+
+        for index in selected_indexes:
+            col = index.column()
+            if col in [4, 6, 7, 8, 9, 10]:
+                continue  # Skip read-only columns
+            if col == 3:  # Start Date column
+                self.model.setData(index, QDateTime.currentDateTime(), Qt.EditRole)
+            else:
+                self.model.setData(index, "", Qt.EditRole)
+
+    def update_gantt_chart(self):
+        self.figure.clear()
+
+        # Get data from model
+        tasks = []
+        start_dates = []
+        end_dates = []
+
+        for row in range(self.model.rowCount()):
+            name = str(self.model._data[row][1])  # Name
+            if not name.strip():
+                continue
+
+            start_date = self.model._data[row][3]  # Start Date
+            if not isinstance(start_date, QDateTime):
+                continue
+
+            end_date_str = str(self.model._data[row][4])  # End Date
+            if not end_date_str:
+                continue
+
+            try:
+                end_date = datetime.strptime(end_date_str, "%Y-%m-%d %H:%M")
+                tasks.append(name)
+                start_dates.append(mdates.date2num(start_date.toPyDateTime()))
+                end_dates.append(mdates.date2num(end_date))
+            except ValueError:
+                continue
+
+        if not tasks:
+            ax = self.figure.add_subplot(111)
+            ax.text(0.5, 0.5, 'No tasks available to display.',
+                   horizontalalignment='center', verticalalignment='center')
+            ax.axis('off')
+            self.canvas.draw()
+            return
+
+        # Create Gantt chart
+        ax = self.figure.add_subplot(111)
+        durations = [end - start for start, end in zip(start_dates, end_dates)]
+        y_positions = range(len(tasks))
+        
+        ax.barh(y_positions, durations, left=start_dates, height=0.3, align='center')
+        ax.set_yticks(y_positions)
+        ax.set_yticklabels(tasks)
+        ax.xaxis_date()
+        
+        ax.xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m-%d'))
+        ax.xaxis.set_major_locator(mdates.WeekdayLocator(interval=1))
+
+        for label in ax.get_xticklabels():
+            label.set_rotation(45)
+            label.set_horizontalalignment('right')
+
+        ax.grid(True)
+        ax.set_title('Project Gantt Chart')
+
+        if start_dates and end_dates:
+            min_date = min(start_dates)
+            max_date = max(end_dates)
+            padding = (max_date - min_date) * 0.05  # 5% padding
+            ax.set_xlim(min_date - padding, max_date + padding)
+
+        # **Inversion of Y-axis to have the first task on top**
+        ax.invert_yaxis()
+
+        self.figure.tight_layout()
+        self.canvas.draw()
+
+    def zoom_in_gantt(self):
+        if not self.figure.axes:
+            return
+        ax = self.figure.axes[0]
+        x_min, x_max = ax.get_xlim()
+        zoom_factor = 0.8
+        new_width = (x_max - x_min) * zoom_factor
+        center = (x_max + x_min) / 2
+        ax.set_xlim(center - new_width / 2, center + new_width / 2)
+        self.canvas.draw()
+
+    def zoom_out_gantt(self):
+        if not self.figure.axes:
+            return
+        ax = self.figure.axes[0]
+        x_min, x_max = ax.get_xlim()
+        zoom_factor = 1.25
+        new_width = (x_max - x_min) * zoom_factor
+        center = (x_max + x_min) / 2
+        ax.set_xlim(center - new_width / 2, center + new_width / 2)
+        self.canvas.draw()
+
+class DateTimeDelegate(QStyledItemDelegate):
+    def createEditor(self, parent, option, index):
+        if index.column() == 3:  # Start Date column
+            editor = QDateTimeEdit(parent)
+            editor.setDisplayFormat("yyyy-MM-dd HH:mm")
+            editor.setCalendarPopup(True)
+            return editor
+        return super().createEditor(parent, option, index)
+
+    def setEditorData(self, editor, index):
+        if index.column() == 3 and isinstance(editor, QDateTimeEdit):
+            date_str = index.model().data(index, Qt.EditRole)
+            date = QDateTime.fromString(date_str, "yyyy-MM-dd HH:mm")
+            editor.setDateTime(date)
+        else:
+            super().setEditorData(editor, index)
+
+    def setModelData(self, editor, model, index):
+        if index.column() == 3 and isinstance(editor, QDateTimeEdit):
+            model.setData(index, editor.dateTime(), Qt.EditRole)
+        else:
+            super().setModelData(editor, model, index)
+
+if __name__ == "__main__":
+    app = QApplication(sys.argv)
+    window = ActivityTableApp()
+    window.show()
+    sys.exit(app.exec_())
+    
